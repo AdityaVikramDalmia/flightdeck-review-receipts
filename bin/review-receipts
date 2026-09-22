@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Bind a caller-authored review to explicitly selected file bytes and modes."""
+import argparse
+import contextlib
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+
+VERSION = "0.1.0rc1"
+RECEIPT_LIMIT = 8 * 1024 * 1024
+NOTES_LIMIT = 1024 * 1024
+DEFAULT_FILES = 256
+DEFAULT_BYTES = 64 * 1024 * 1024
+MAX_DEPTH = 64
+
+
+class ReceiptError(Exception):
+    pass
+
+
+class MissingReceipt(ReceiptError):
+    pass
+
+
+def text(value, limit, name, nonempty=False):
+    if not isinstance(value, str):
+        raise ReceiptError(name + " must be text")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeError as exc:
+        raise ReceiptError(name + " must be valid Unicode") from exc
+    if size > limit or (nonempty and not value):
+        raise ReceiptError(name + " exceeds its byte limit or is empty")
+    return value
+
+
+def relative_path(value):
+    text(value, 4096, "artifact path", True)
+    parts = value.split("/")
+    if len(parts) > MAX_DEPTH or any(part in ("", ".", "..") for part in parts) or "\0" in value:
+        raise ReceiptError("artifact paths must be canonical root-relative paths without empty, dot, or parent components")
+    return value
+
+
+def selection(values, limit):
+    if not values or len(values) > limit:
+        raise ReceiptError("select at least one file within --max-files")
+    paths = [relative_path(value) for value in values]
+    if len(paths) != len(set(paths)):
+        raise ReceiptError("duplicate selected file")
+    return sorted(paths)
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ReceiptError("duplicate JSON object key: " + key)
+        result[key] = value
+    return result
+
+
+def signature(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def leaf_path(value):
+    if not value:
+        raise ReceiptError("explicit file path must not be empty")
+    path = Path(value).absolute()
+    if not path.name or path.name in (".", ".."):
+        raise ReceiptError("explicit file path required")
+    return path.parent.resolve() / path.name
+
+
+def read_regular(path, limit):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise ReceiptError("input must be a regular file within its byte limit")
+        content = bytearray()
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, limit - len(content) + 1))
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > limit:
+                raise ReceiptError("input exceeds its byte limit")
+        if signature(before) != signature(os.fstat(descriptor)):
+            raise ReceiptError("input changed while being read")
+        return bytes(content)
+    finally:
+        os.close(descriptor)
+
+
+def validate(receipt, max_files):
+    if not isinstance(receipt, dict) or set(receipt) != {"version", "created_at", "algorithm", "binding", "review", "files"}:
+        raise ReceiptError("invalid receipt envelope")
+    if type(receipt["version"]) is not int or receipt["version"] != 1 or receipt["algorithm"] != "sha256" or receipt["binding"] != "bytes-and-posix-mode":
+        raise ReceiptError("unsupported receipt version or binding")
+    stamp = receipt["created_at"]
+    if not isinstance(stamp, str):
+        raise ReceiptError("invalid created_at")
+    try:
+        parsed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S.%fZ")
+        if parsed.strftime("%Y-%m-%dT%H:%M:%S.%fZ") != stamp:
+            raise ValueError("noncanonical timestamp")
+    except ValueError as exc:
+        raise ReceiptError("invalid created_at") from exc
+    review = receipt["review"]
+    if not isinstance(review, dict) or set(review) != {"reviewer", "label", "verdict", "notes", "evidence"}:
+        raise ReceiptError("invalid review fields")
+    text(review["reviewer"], 1024, "reviewer", True)
+    text(review["label"], 1024, "label", True)
+    text(review["verdict"], 1024, "verdict", True)
+    text(review["notes"], NOTES_LIMIT, "notes")
+    if not isinstance(review["evidence"], list) or len(review["evidence"]) > 128:
+        raise ReceiptError("invalid evidence list")
+    for evidence in review["evidence"]:
+        text(evidence, 4096, "evidence", True)
+    files = receipt["files"]
+    if not isinstance(files, list) or not 1 <= len(files) <= max_files:
+        raise ReceiptError("invalid or oversized artifact list")
+    paths = []
+    for row in files:
+        if not isinstance(row, dict) or set(row) != {"path", "size", "sha256", "mode"}:
+            raise ReceiptError("invalid artifact fields")
+        paths.append(relative_path(row["path"]))
+        if type(row["size"]) is not int or row["size"] < 0:
+            raise ReceiptError("invalid artifact size")
+        if type(row["mode"]) is not int or not 0 <= row["mode"] <= 0o7777:
+            raise ReceiptError("invalid artifact mode")
+        if not isinstance(row["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"]):
+            raise ReceiptError("invalid artifact digest")
+    if len(paths) != len(set(paths)) or paths != sorted(paths):
+        raise ReceiptError("artifact paths must be unique and sorted")
+    return receipt
+
+
+def load_receipt(path, max_files):
+    try:
+        data = read_regular(path, RECEIPT_LIMIT)
+    except FileNotFoundError as exc:
+        raise MissingReceipt("receipt is missing") from exc
+    def invalid_constant(value):
+        raise ReceiptError("invalid JSON numeric constant")
+    return validate(json.loads(data, object_pairs_hook=unique_object, parse_constant=invalid_constant), max_files)
+
+
+def root_path(value):
+    if not value:
+        raise ReceiptError("explicit root must not be empty")
+    path = Path(value).absolute()
+    if path.name in (".", ".."):
+        return path.resolve()
+    return path.parent.resolve() / path.name
+
+
+@contextlib.contextmanager
+def root_directory(value):
+    descriptor = os.open(root_path(value), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def snapshot_file(root, path, remaining, receipt_path=None):
+    # Receipt paths never become absolute paths or follow symlinks during reads.
+    parts = relative_path(path).split("/")
+    parent = os.dup(root)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise ReceiptError("selected artifact is not a regular file: " + repr(path))
+            if receipt_path is not None:
+                try:
+                    destination = receipt_path.lstat()
+                except FileNotFoundError:
+                    destination = None
+                if destination is not None and (destination.st_dev, destination.st_ino) == (before.st_dev, before.st_ino):
+                    raise ReceiptError("receipt destination aliases a selected artifact")
+            if before.st_size > remaining:
+                raise ReceiptError("selected files exceed --max-bytes")
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining - size + 1))
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > remaining:
+                    raise ReceiptError("selected files exceed --max-bytes")
+                digest.update(chunk)
+            after = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+            if size != before.st_size or signature(before) != signature(os.fstat(descriptor)) or signature(before) != signature(after):
+                raise ReceiptError("selected artifact changed during reading: " + repr(path))
+            return {"path": path, "size": size, "sha256": digest.hexdigest(), "mode": stat.S_IMODE(before.st_mode)}, (before.st_dev, before.st_ino)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent)
+
+
+def notes_from(value):
+    if value == "-":
+        try:
+            data = sys.stdin.buffer.read(NOTES_LIMIT + 1)
+        except (AttributeError, OSError, ValueError) as exc:
+            raise ReceiptError("notes input stream is unavailable") from exc
+        if len(data) > NOTES_LIMIT:
+            raise ReceiptError("notes exceed 1 MiB")
+    else:
+        data = read_regular(leaf_path(value), NOTES_LIMIT)
+    return data.decode("utf-8")
+
+
+def publish(path, receipt, overwrite, selected_identities):
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        if not stat.S_ISREG(existing.st_mode):
+            raise ReceiptError("receipt destination must be a regular file, not a symlink or special file")
+        if (existing.st_dev, existing.st_ino) in selected_identities:
+            raise ReceiptError("receipt destination aliases a selected artifact")
+        if not overwrite:
+            raise ReceiptError("receipt already exists; --overwrite is required")
+    data = (json.dumps(receipt, ensure_ascii=True, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    if len(data) > RECEIPT_LIMIT:
+        raise ReceiptError("receipt exceeds 8 MiB")
+    descriptor, temporary = tempfile.mkstemp(prefix=".review-receipts-", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
+def run(args):
+    if not 1 <= args.max_files <= 10000 or args.max_bytes < 0:
+        raise ReceiptError("limits require 1-10000 files and nonnegative bytes")
+    receipt_path = leaf_path(args.receipt)
+    if args.command == "inspect":
+        return {"status": "valid", "scope": "receipt_schema_only", "receipt": load_receipt(receipt_path, args.max_files)}, 0
+    paths = selection(args.file, args.max_files)
+    if args.command == "check":
+        receipt = load_receipt(receipt_path, args.max_files)
+        if [row["path"] for row in receipt["files"]] != paths:
+            raise ReceiptError("expected --file selection does not exactly match receipt artifacts")
+    else:
+        receipt = {"version": 1, "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                   "algorithm": "sha256", "binding": "bytes-and-posix-mode",
+                   "review": {"reviewer": args.reviewer, "label": args.label, "verdict": args.verdict,
+                              "notes": notes_from(args.notes_file), "evidence": args.evidence}, "files": []}
+    selected_root = root_path(args.root)
+    selected_locations = {selected_root / path for path in paths}
+    current = []
+    identities = set()
+    remaining = args.max_bytes
+    with root_directory(args.root) as root:
+        for path in paths:
+            try:
+                if args.command == "author":
+                    row, identity = snapshot_file(root, path, remaining, receipt_path)
+                else:
+                    row, identity = snapshot_file(root, path, remaining)
+            except FileNotFoundError:
+                if args.command == "author":
+                    raise ReceiptError("selected artifact is missing: " + repr(path))
+                continue
+            remaining -= row["size"]
+            current.append(row)
+            identities.add(identity)
+    if args.command == "author":
+        # A concurrent replacement changes inode identity but does not make a
+        # selected pathname safe to overwrite with the receipt itself.
+        if receipt_path in selected_locations:
+            raise ReceiptError("receipt destination is a selected artifact path")
+        receipt["files"] = current
+        validate(receipt, args.max_files)
+        publish(receipt_path, receipt, args.overwrite, identities)
+        return {"status": "written", "artifacts": len(current), "receipt": str(receipt_path)}, 0
+    indexed = {row["path"]: row for row in current}
+    findings = []
+    for before in receipt["files"]:
+        after = indexed.get(before["path"])
+        if after is None:
+            findings.append({"path": before["path"], "state": "missing", "fields": []})
+        elif before != after:
+            findings.append({"path": before["path"], "state": "changed", "fields": sorted(key for key in before if before[key] != after[key])})
+    return {"status": "stale" if findings else "valid", "scope": "exact_selected_bytes_and_modes",
+            "checked_files": len(current), "expected_files": len(paths), "findings": findings,
+            "review": receipt["review"]}, 3 if findings else 0
+
+
+def emit(result, structured):
+    if structured:
+        output = json.dumps(result, ensure_ascii=True, sort_keys=True)
+    else:
+        # Metadata is caller text. JSON quoting preserves control characters and
+        # prevents multiline values from masquerading as status headings.
+        output = result["status"].upper() + "\n" + json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+    sys.stdout.write(output + "\n")
+    sys.stdout.flush()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version="review-receipts " + VERSION)
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("author", "inspect", "check"):
+        command = commands.add_parser(name)
+        command.add_argument("--receipt", required=True)
+        command.add_argument("--json", action="store_true")
+        command.add_argument("--max-files", type=int, default=DEFAULT_FILES)
+        command.add_argument("--max-bytes", type=int, default=DEFAULT_BYTES)
+        if name != "inspect":
+            command.add_argument("--root", required=True)
+            command.add_argument("--file", action="append", required=True)
+        if name == "author":
+            command.add_argument("--reviewer", required=True)
+            command.add_argument("--label", required=True)
+            command.add_argument("--verdict", required=True)
+            command.add_argument("--notes-file", required=True, help="UTF-8 regular file, or - for explicitly selected stdin")
+            command.add_argument("--evidence", action="append", default=[])
+            command.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        result, code = run(args)
+    except MissingReceipt as exc:
+        result, code = {"status": "missing", "error": str(exc)}, 4
+    except (ReceiptError, OSError, ValueError, RuntimeError) as exc:
+        result, code = {"status": "invalid", "error": str(exc)}, 2
+    try:
+        emit(result, args.json)
+    except (OSError, ValueError, UnicodeError, AttributeError):
+        # Publication may already have completed. Never report success when the
+        # caller's output stream could not receive the receipt/result.
+        try:
+            sys.stderr.write("review-receipts: output failed; inspect any published receipt before retrying\n")
+            sys.stderr.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
+        return 2
+    return code
+
+
+if __name__ == "__main__":
+    code = main()
+    # An explicit flush above detected output failure; avoid a second interpreter
+    # flush changing the promised error exit into Python's shutdown code 120.
+    if code == 2:
+        try:
+            sys.stdout.close()
+        except (OSError, ValueError, AttributeError):
+            pass
+    sys.exit(code)
