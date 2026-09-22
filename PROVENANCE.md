@@ -15,5 +15,4 @@ It does not copy project-specific review questions, fences, policy IDs, model
 routing, dispatch behavior, recipe linting, or reviewer automation. No private
 runtime state is included. Examples and tests contain only synthetic inputs.
 
-Private candidate; redistribution license pending. Publication and licensing terms
-remain the owner's decision.
+Private candidate; Apache-2.0 licensed; public launch deferred. The owner selected Apache-2.0 on 2026-09-22; public launch remains deferred.

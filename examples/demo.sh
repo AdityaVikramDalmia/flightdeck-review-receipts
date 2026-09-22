@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Deprecated reference example for new Claude Code integrations (2026-09-22).
 set -euo pipefail
 TOOL="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/review-receipts"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/review-receipts-demo.XXXXXX")
