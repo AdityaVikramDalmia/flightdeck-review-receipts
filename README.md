@@ -1,15 +1,15 @@
 # Review Receipts
 
 > **Deprecated for new Claude Code integrations — 2026-09-22.** Retained as an
-> Apache-2.0 reference project. Public launch remains deferred and the repository
-> remains private. This is a maintainer status decision, not a claim that Claude
+> Apache-2.0 public reference implementation. This is a maintainer status
+> decision, not a claim that Claude
 > Code replaces every capability. No ongoing feature work or support is promised.
 
 Bind a caller-authored review to the exact bytes and POSIX modes of selected files,
 then check whether those files still match. Preserve reviewer identity, label,
 verdict, notes, and opaque evidence references in a portable JSON receipt.
 
-**Private candidate: 0.1.0rc1; Apache-2.0 licensed; public launch deferred.** Requires Python
+**Public reference implementation: 0.1.0rc1; Apache-2.0 licensed; deprecated for new Claude Code integrations as of 2026-09-22.** Requires Python
 3.9+ on macOS or Linux with descriptor-relative filesystem operations. The single
 executable has no packages, Git dependency, network calls, or model integration.
 Windows is unsupported.
@@ -67,6 +67,6 @@ and [provenance](PROVENANCE.md) for the adaptation.
 ## License and maintenance
 
 Copyright 2026 Aditya Dalmia. Licensed under [Apache-2.0](LICENSE), with
-[attribution](NOTICE) and [source provenance](PROVENANCE.md). Public launch is
-deferred; repository access remains private. See the [release preparation index](docs/release/README.md),
+[attribution](NOTICE) and [source provenance](PROVENANCE.md). This is a public
+reference implementation, deprecated for new Claude Code integrations as of 2026-09-22. See the [release preparation index](docs/release/README.md),
 [contributing guide](CONTRIBUTING.md), and [security contact](SECURITY.md).
